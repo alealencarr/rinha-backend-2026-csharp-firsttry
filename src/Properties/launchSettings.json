@@ -1,12 +1,12 @@
 {
   "profiles": {
-    "Api": {
+    "Rinha.Fraud": {
       "commandName": "Project",
       "launchBrowser": true,
       "environmentVariables": {
         "ASPNETCORE_ENVIRONMENT": "Development"
       },
-      "applicationUrl": "https://localhost:55902;http://localhost:55903"
+      "applicationUrl": "https://localhost:49360;http://localhost:49361"
     }
   }
 }

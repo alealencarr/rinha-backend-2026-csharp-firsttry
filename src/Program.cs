@@ -1,83 +1,55 @@
-using FraudApi;
-using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Server.Kestrel.Core;
+
+// ---------------------------------------------------------------------------
+// Rinha de Backend 2026 - Detecção de fraude por busca vetorial
+// API .NET 9 NativeAOT, hot path sem alocação, kNN brute-force SIMD exato.
+// ---------------------------------------------------------------------------
 
 var builder = WebApplication.CreateSlimBuilder(args);
 
-builder.WebHost.ConfigureKestrel(options =>
-{
-    options.AddServerHeader = false;
-});
+// Zero logging no hot path (cada log = syscall + alocação).
+builder.Logging.ClearProviders();
 
-builder.Services.ConfigureHttpJsonOptions(o =>
-    o.SerializerOptions.TypeInfoResolverChain.Insert(0, AppJsonContext.Default));
+builder.WebHost.ConfigureKestrel(o =>
+{
+    o.AddServerHeader = false;                       // header inútil, menos bytes
+    o.Limits.MaxRequestBodySize = 64 * 1024;         // payloads são < 1 KB
+    o.ConfigureEndpointDefaults(lo => lo.Protocols = HttpProtocols.Http1); // sem custo HTTP/2
+});
 
 var app = builder.Build();
 
-KnnIndex? index = null;
-var indexPath = Environment.GetEnvironmentVariable("INDEX_PATH") ?? "/data/references.i16.bin";
-
+// Store vetorial 100% em memória. Carregado em background; /ready só fica 2xx
+// quando o dataset terminou de carregar.
+var dir = Environment.GetEnvironmentVariable("RESOURCES_DIR") ?? "/app";
+var store = new FraudStore();
 _ = Task.Run(() =>
 {
-    while (!File.Exists(indexPath)) Thread.Sleep(100);
-    var idx = new KnnIndex(indexPath);
-    Volatile.Write(ref index, idx);
-    Console.WriteLine($"[ready] index mapped: {idx.Count} reference vectors");
+    try { store.Load(Path.Combine(dir, "references.json")); }
+    catch (Exception ex) { Console.Error.WriteLine("LOAD FAILED: " + ex); }
 });
 
-app.Run(async context =>
+var fraudPath = new PathString("/fraud-score");
+var readyPath = new PathString("/ready");
+
+// Dispatch manual por path: mais barato que o roteamento por endpoints.
+app.Run(async ctx =>
 {
-    try
+    var path = ctx.Request.Path;
+    if (path.Equals(fraudPath, StringComparison.Ordinal))
     {
-        var path = context.Request.Path.Value;
-
-        if (path == "/ready")
-        {
-            context.Response.StatusCode = Volatile.Read(ref index) is null ? 503 : 200;
-            return;
-        }
-
-        if (path == "/fraud-score")
-        {
-            var idx = Volatile.Read(ref index);
-            if (idx is null)
-            {
-                context.Response.StatusCode = 503;
-                return;
-            }
-
-            var req = await context.Request.ReadFromJsonAsync(AppJsonContext.Default.FraudRequest);
-            if (req is null)
-            {
-                context.Response.StatusCode = 400;
-                return;
-            }
-
-            Span<short> query = stackalloc short[Vectorizer.Pad];
-            Vectorizer.Quantize(req, query);
-
-            double score = idx.Score(query);
-
-            // Bypass extremo da Camada de Serialização
-            context.Response.StatusCode = 200;
-            context.Response.ContentType = "application/json";
-
-            string scoreStr = score.ToString(System.Globalization.CultureInfo.InvariantCulture);
-            string resp = score < 0.6
-                ? $"{{\"approved\":true,\"fraud_score\":{scoreStr}}}"
-                : $"{{\"approved\":false,\"fraud_score\":{scoreStr}}}";
-
-            await context.Response.WriteAsync(resp);
-            return;
-        }
-
-        context.Response.StatusCode = 404;
+        await Handlers.Fraud(ctx, store);
     }
-    catch (Exception)
+    else if (path.Equals(readyPath, StringComparison.Ordinal))
     {
-        context.Response.StatusCode = 200;
-        context.Response.ContentType = "application/json";
-        await context.Response.WriteAsync("{\"approved\":true,\"fraud_score\":0.0}");
+        ctx.Response.StatusCode = store.Ready
+            ? StatusCodes.Status200OK
+            : StatusCodes.Status503ServiceUnavailable;
+    }
+    else
+    {
+        ctx.Response.StatusCode = StatusCodes.Status404NotFound;
     }
 });
 
-app.Run();
+await app.RunAsync();

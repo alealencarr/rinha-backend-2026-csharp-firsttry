@@ -1,40 +1,48 @@
-# syntax=docker/dockerfile:1
+# =============================================================================
+# Build NativeAOT (linux-x64 == linux-amd64). Construa SEMPRE com:
+#   docker buildx build --platform linux/amd64 ...
+# A Rinha roda num Mac Mini Intel (amd64).
+# =============================================================================
+FROM mcr.microsoft.com/dotnet/sdk:9.0 AS build
 
-# ---------------------------------------------------------------------------
-# Stage 1 — preprocess the dataset (references.json.gz -> int16 IVF binary).
-# ---------------------------------------------------------------------------
-FROM --platform=linux/amd64 python:3.12-slim AS data
-WORKDIR /w
-# Instalamos as bibliotecas matemáticas para rodar o K-Means rápido
-RUN pip install --no-cache-dir scikit-learn numpy
-COPY preprocess.py .
-COPY resources/references.json.gz .
-RUN python preprocess.py references.json.gz references.i16.bin
+# Toolchain do NativeAOT no Linux
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends clang zlib1g-dev \
+ && rm -rf /var/lib/apt/lists/*
 
-# ---------------------------------------------------------------------------
-# Stage 2 — Native AOT build.
-# ---------------------------------------------------------------------------
-FROM --platform=linux/amd64 mcr.microsoft.com/dotnet/sdk:9.0 AS build
-RUN apt-get update && apt-get install -y --no-install-recommends clang zlib1g-dev \
-    && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
-COPY src/Api.csproj ./
-RUN dotnet restore -r linux-x64
-COPY src/ ./
-RUN dotnet publish Api.csproj -c Release -r linux-x64 --no-restore -o /app
 
-# ---------------------------------------------------------------------------
-# Stage 3 — runtime.
-# ---------------------------------------------------------------------------
-FROM --platform=linux/amd64 mcr.microsoft.com/dotnet/runtime-deps:9.0 AS final
+# Cache de restore
+COPY src/Rinha.Fraud.csproj ./src/
+RUN dotnet restore ./src/Rinha.Fraud.csproj -r linux-x64
+
+# Código + recursos
+COPY src/ ./src/
+COPY resources/ ./resources/
+
+# Publica o binário nativo
+RUN dotnet publish ./src/Rinha.Fraud.csproj -c Release -r linux-x64 \
+    --no-restore -o /publish /p:PublishAot=true
+
+# Descomprime o dataset no build => sem dependência de zlib em runtime
+# e startup mais rápido (lê JSON puro).
+RUN gzip -dc resources/references.json.gz > /publish/references.json \
+ && ls -lh /publish/references.json
+
+# =============================================================================
+# Runtime mínimo (chiseled, sem shell, non-root). Só precisa de glibc/libstdc++.
+# =============================================================================
+FROM mcr.microsoft.com/dotnet/runtime-deps:9.0-noble-chiseled AS final
 WORKDIR /app
-COPY --from=build /app/Api ./Api
-COPY --from=data  /w/references.i16.bin /data/references.i16.bin
 
-ENV ASPNETCORE_URLS=http://0.0.0.0:8080
-ENV INDEX_PATH=/data/references.i16.bin
-ENV DOTNET_gcServer=0
-ENV DOTNET_GCHeapHardLimit=0
+COPY --from=build /publish/rinha            /app/rinha
+COPY --from=build /publish/references.json  /app/references.json
+
+ENV ASPNETCORE_URLS=http://+:8080 \
+    RESOURCES_DIR=/app \
+    DOTNET_gcServer=0 \
+    DOTNET_GCHeapHardLimitPercent=75 \
+    DOTNET_TieredPGO=0
 
 EXPOSE 8080
-ENTRYPOINT ["/app/Api"]
+ENTRYPOINT ["/app/rinha"]
