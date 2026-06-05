@@ -1,7 +1,6 @@
 services:
   api1:
     build: .
-    image: rinha-fraud-dotnet
     networks: [app]
     deploy:
       resources:
@@ -11,7 +10,6 @@ services:
 
   api2:
     build: .
-    image: rinha-fraud-dotnet
     depends_on: [api1]
     networks: [app]
     deploy:
