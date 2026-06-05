@@ -1,0 +1,7 @@
+{
+    "participants": ["Alexandre Alencar"],
+    "social": ["https://github.com/alealencarr"],
+    "source-code-repo": "https://github.com/alealencarr/rinha-backend-2026-csharp-firsttry",
+    "stack": ["dotnet-9", "native-aot", "nginx", "simd-avx2"],
+    "open_to_work": false
+}
