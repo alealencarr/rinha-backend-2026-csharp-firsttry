@@ -1,9 +1,6 @@
 services:
   api1:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: rinha-fraud-dotnet:latest
+    image: rinha-fraud-dotnet:latest # Use a tag que você definiu
     networks: [app]
     deploy:
       resources:
@@ -14,9 +11,6 @@ services:
   api2:
     image: rinha-fraud-dotnet:latest
     depends_on: [api1]
-    build:                      
-      context: .
-      dockerfile: Dockerfile    
     networks: [app]
     deploy:
       resources:
