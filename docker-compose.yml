@@ -1,6 +1,7 @@
 services:
   api1:
-    image: rinha-fraud-dotnet:latest # Use a tag que você definiu
+    build: .
+    image: rinha-fraud-dotnet
     networks: [app]
     deploy:
       resources:
@@ -9,7 +10,8 @@ services:
           memory: "163MB"
 
   api2:
-    image: rinha-fraud-dotnet:latest
+    build: .
+    image: rinha-fraud-dotnet
     depends_on: [api1]
     networks: [app]
     deploy:
