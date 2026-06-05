@@ -1,0 +1,7 @@
+bin/
+obj/
+.vs/
+*.user
+# Keep resources/references.json.gz committed (build input).
+# The generated binary is produced at build time:
+references.i16.bin
