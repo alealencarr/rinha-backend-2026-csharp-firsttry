@@ -4,21 +4,24 @@ using System.Text.Json;
 /// <summary>
 /// Transforma o payload JSON da transação no vetor de 14 dimensões definido em
 /// REGRAS_DE_DETECCAO.md. Parsing direto com Utf8JsonReader (sem desserializar
-/// para objetos), comparando nomes de campo em UTF-8 e gravando o vetor numa
-/// Span da stack. Zero alocação no heap.
+/// para objetos), comparando nomes de campo em UTF-8. Zero alocação no heap.
+///
+/// O cálculo é feito em DOUBLE para que o arredondamento para 4 casas (feito na
+/// quantização do FraudStore) bata com o do gerador oficial. Computar em float
+/// introduziria erro na 4ª casa em alguns casos e desalinharia vizinhos.
 /// </summary>
 internal static class Vectorizer
 {
     // Constantes de normalization.json (estáveis durante o teste).
     private const double MaxAmount = 10000.0;
-    private const float MaxInstallments = 12f;
+    private const double MaxInstallments = 12.0;
     private const double AmountVsAvgRatio = 10.0;
     private const double MaxMinutes = 1440.0;
     private const double MaxKm = 1000.0;
-    private const float MaxTxCount24h = 20f;
+    private const double MaxTxCount24h = 20.0;
     private const double MaxMerchantAvg = 10000.0;
 
-    public static void BuildVector(ReadOnlySpan<byte> json, Span<float> v)
+    public static void BuildVector(ReadOnlySpan<byte> json, Span<double> v)
     {
         double amount = 0, custAvg = 0, merchAvg = 0, kmHome = 0, lastKm = 0;
         int installments = 0, txCount = 0, mcc = -1;
@@ -141,41 +144,41 @@ internal static class Vectorizer
         }
 
         // ----- montagem das 14 dimensões (ordem e fórmulas do doc oficial) -----
-        v[0] = Clamp01((float)(amount / MaxAmount));
+        v[0] = Clamp01(amount / MaxAmount);
         v[1] = Clamp01(installments / MaxInstallments);
-        v[2] = Clamp01((float)((amount / custAvg) / AmountVsAvgRatio));
+        v[2] = Clamp01((amount / custAvg) / AmountVsAvgRatio);
 
         int hour = reqUtc.Hour;                       // 0-23 UTC
         int dow = ((int)reqUtc.DayOfWeek + 6) % 7;    // seg=0 ... dom=6
-        v[3] = hour / 23f;
-        v[4] = dow / 6f;
+        v[3] = hour / 23.0;                            // sem clamp (doc não limita)
+        v[4] = dow / 6.0;
 
         if (hasLast)
         {
             double mins = (reqUtc - lastUtc).TotalMinutes;
-            v[5] = Clamp01((float)(mins / MaxMinutes));
-            v[6] = Clamp01((float)(lastKm / MaxKm));
+            v[5] = Clamp01(mins / MaxMinutes);
+            v[6] = Clamp01(lastKm / MaxKm);
         }
         else
         {
-            v[5] = -1f;
-            v[6] = -1f;
+            v[5] = -1.0;
+            v[6] = -1.0;
         }
 
-        v[7] = Clamp01((float)(kmHome / MaxKm));
+        v[7] = Clamp01(kmHome / MaxKm);
         v[8] = Clamp01(txCount / MaxTxCount24h);
-        v[9] = isOnline ? 1f : 0f;
-        v[10] = cardPresent ? 1f : 0f;
-        v[11] = IsUnknown(midBuf, midLen, kmBuf, kmStart, kmLen, kmCount) ? 1f : 0f;
+        v[9] = isOnline ? 1.0 : 0.0;
+        v[10] = cardPresent ? 1.0 : 0.0;
+        v[11] = IsUnknown(midBuf, midLen, kmBuf, kmStart, kmLen, kmCount) ? 1.0 : 0.0;
         v[12] = MccRisk(mcc);
-        v[13] = Clamp01((float)(merchAvg / MaxMerchantAvg));
+        v[13] = Clamp01(merchAvg / MaxMerchantAvg);
     }
 
-    private static float Clamp01(float x)
+    private static double Clamp01(double x)
     {
-        if (float.IsNaN(x)) return 0f;   // ex.: 0/0 em amount_vs_avg
-        if (x < 0f) return 0f;
-        if (x > 1f) return 1f;
+        if (double.IsNaN(x)) return 0.0;   // ex.: 0/0 em amount_vs_avg
+        if (x < 0.0) return 0.0;
+        if (x > 1.0) return 1.0;
         return x;
     }
 
@@ -193,19 +196,19 @@ internal static class Vectorizer
     }
 
     // mcc_risk.json (default 0.5 quando não mapeado).
-    private static float MccRisk(int mcc) => mcc switch
+    private static double MccRisk(int mcc) => mcc switch
     {
-        5411 => 0.15f,
-        5812 => 0.30f,
-        5912 => 0.20f,
-        5944 => 0.45f,
-        7801 => 0.80f,
-        7802 => 0.75f,
-        7995 => 0.85f,
-        4511 => 0.35f,
-        5311 => 0.25f,
-        5999 => 0.50f,
-        _ => 0.5f,
+        5411 => 0.15,
+        5812 => 0.30,
+        5912 => 0.20,
+        5944 => 0.45,
+        7801 => 0.80,
+        7802 => 0.75,
+        7995 => 0.85,
+        4511 => 0.35,
+        5311 => 0.25,
+        5999 => 0.50,
+        _ => 0.5,
     };
 
     private static bool IsUnknown(ReadOnlySpan<byte> mid, int midLen, ReadOnlySpan<byte> kmBuf,

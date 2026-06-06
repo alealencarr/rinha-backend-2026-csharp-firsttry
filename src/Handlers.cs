@@ -46,17 +46,17 @@ internal static class Handlers
 
         if ((uint)fraud > 5u) fraud = 0; // blindagem do índice
 
-        var bytes = Responses.ByFraudCount[fraud];
+        var bytes = store.Responses[fraud];
         res.StatusCode = StatusCodes.Status200OK;
         res.ContentType = "application/json";
         res.ContentLength = bytes.Length;
         await res.Body.WriteAsync(bytes);
     }
 
-    // Síncrono de propósito: o Span<float> (ref struct) não pode cruzar um await.
+    // Síncrono de propósito: o Span<double> (ref struct) não pode cruzar um await.
     private static int Compute(in ReadOnlySequence<byte> buffer, FraudStore store)
     {
-        Span<float> v = stackalloc float[14];
+        Span<double> v = stackalloc double[14];
         byte[]? rented = null;
         try
         {
@@ -74,7 +74,7 @@ internal static class Handlers
             }
 
             Vectorizer.BuildVector(span, v);
-            return store.FraudCountTop5(v);
+            return store.CountTop5(v);
         }
         finally
         {

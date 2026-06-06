@@ -14,6 +14,10 @@
     <OptimizationPreference>Speed</OptimizationPreference>
     <IlcOptimizationPreference>Speed</IlcOptimizationPreference>
 
+    <!-- Alvo do teste é Haswell (AVX2). Compila com AVX2 => Vector<short> de 256
+         bits (16 lanes) no kernel k-NN. Mantém Vector.IsHardwareAccelerated true. -->
+    <IlcInstructionSet>avx2</IlcInstructionSet>
+
     <!-- GC workstation, não-concorrente: menor footprint (importante p/ 150MB).
          Hot path é ~zero-alloc, então o GC quase não roda. -->
     <ServerGarbageCollection>false</ServerGarbageCollection>

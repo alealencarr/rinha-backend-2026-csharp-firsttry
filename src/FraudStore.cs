@@ -1,36 +1,53 @@
 using System.Numerics;
+using System.Text;
 using System.Text.Json;
 
 /// <summary>
-/// Armazena os 100k vetores de referência em layout SoA (struct-of-arrays):
-/// _dims[d * N + i] = dimensão d do vetor i. Isso permite que o brute-force kNN
-/// processe Vector&lt;float&gt;.Count referências por instrução SIMD, com acesso
-/// sequencial perfeito por dimensão e sem sobra (tail) quando N % Count == 0.
+/// Store vetorial + classificador k-NN EXATO que reproduz o gabarito oficial.
 ///
-/// A busca é EXATA (distância euclidiana ao quadrado, mesma ordenação de vizinhos
-/// da euclidiana). Nada de ANN/HNSW: a pontuação de detecção satura em +3000
-/// apenas com E=0, então qualquer aproximação que erre 1 vizinho já custa pontos.
+/// O gabarito do teste é gerado rodando exatamente: k=5, votação por maioria,
+/// distância euclidiana sobre vetores de 14 dimensões com 4 casas decimais
+/// (REGRAS_DE_DETECCAO.md / DATASET.md). Para zerar FP/FN é preciso reproduzir
+/// isso bit a bit. Por isso:
+///   - quantizamos tudo para inteiro na escala 10000 (4 casas) => distância
+///     inteira EXATA, sem ruído de ponto flutuante;
+///   - k=5 e limiar 0.6 são fixos (NÃO se afina nada: afinar afastaria do gabarito);
+///   - empate de distância é resolvido pelo MENOR índice (ordem do dataset),
+///     que é o comportamento estável do gerador;
+///   - int16 (short) também corta a banda de memória pela metade => ~2x vazão.
 /// </summary>
 internal sealed class FraudStore
 {
-    private float[] _dims = Array.Empty<float>();
-    private byte[] _labels = Array.Empty<byte>(); // 1 = fraud, 0 = legit
+    private const int K = 5;
+    private const int Scale = 10000;
+
+    private short[] _dims = Array.Empty<short>();   // SoA quantizada: _dims[d*N + i]
+    private byte[] _labels = Array.Empty<byte>();   // 1 = fraud, 0 = legit
     private int _n;
+
+    private byte[][] _responses = Array.Empty<byte[]>();
     private volatile bool _ready;
 
     public bool Ready => _ready;
+    public byte[][] Responses => _responses;
 
     public void Load(string jsonPath)
     {
         byte[] json = File.ReadAllBytes(jsonPath);
         Index(json);
+        BuildResponses();
         _ready = true;
+        Console.Error.WriteLine($"READY: n={_n} k=5 limiar=0.6 (int16 escala {Scale}, euclidiana exata)");
     }
+
+    // 4 casas decimais -> inteiro. Math.Round em ToEven (padrão) casa com o
+    // printf("%.4f") usado para serializar as referências.
+    private static short Q(double v) => (short)Math.Round(v * Scale, MidpointRounding.ToEven);
 
     private void Index(ReadOnlySpan<byte> json)
     {
         int cap = 100_000;
-        float[] aos = new float[cap * 14]; // temporário row-major durante o parse
+        short[] aos = new short[cap * 14];
         byte[] labs = new byte[cap];
         int n = 0;
 
@@ -56,7 +73,7 @@ internal sealed class FraudStore
                     int d = 0;
                     while (r.Read() && r.TokenType != JsonTokenType.EndArray)
                     {
-                        if (d < 14) aos[baseI + d] = (float)r.GetDouble();
+                        if (d < 14) aos[baseI + d] = Q(r.GetDouble());
                         d++;
                     }
                 }
@@ -70,8 +87,8 @@ internal sealed class FraudStore
             n++;
         }
 
-        // Transpõe AoS -> SoA com stride = n (sem buracos).
-        float[] soa = new float[n * 14];
+        // AoS -> SoA (layout que o SIMD percorre por dimensão).
+        short[] soa = new short[n * 14];
         for (int i = 0; i < n; i++)
         {
             int bi = i * 14;
@@ -83,95 +100,113 @@ internal sealed class FraudStore
         _n = n;
     }
 
-    /// <summary>
-    /// Retorna quantos dos 5 vizinhos mais próximos são fraude (0..5).
-    /// fraud_score = retorno / 5 ; approved = retorno &lt; 3 (threshold 0.6).
-    /// </summary>
-    public int FraudCountTop5(ReadOnlySpan<float> q)
+    private void BuildResponses()
     {
-        var dims = _dims;
-        var labs = _labels;
-        int N = _n;
+        // k=5 fixo: fraud_score = c/5; approved = fraud_score < 0.6 (c <= 2).
+        string[] scores = { "0.0", "0.2", "0.4", "0.6", "0.8", "1.0" };
+        var arr = new byte[6][];
+        for (int c = 0; c <= 5; c++)
+        {
+            bool approved = (c / 5.0) < 0.6;
+            string json = "{\"approved\":" + (approved ? "true" : "false") + ",\"fraud_score\":" + scores[c] + "}";
+            arr[c] = Encoding.UTF8.GetBytes(json);
+        }
+        _responses = arr;
+    }
+
+    /// <summary>Conta fraudes entre os 5 vizinhos mais próximos (0..5).</summary>
+    public int CountTop5(ReadOnlySpan<double> v)
+    {
+        Span<short> q = stackalloc short[14];
+        for (int d = 0; d < 14; d++) q[d] = Q(v[d]);
+
+        Span<int> bd = stackalloc int[K];
+        Span<byte> bl = stackalloc byte[K];
+        for (int j = 0; j < K; j++) { bd[j] = int.MaxValue; bl[j] = 0; }
+        int worst = int.MaxValue, filled = 0;
+
+        var dims = _dims; var labs = _labels; int N = _n;
         if (N == 0) return 0;
 
-        // Broadcast de cada dimensão do query (hoisted para fora do laço).
-        Vector<float> q0 = new(q[0]), q1 = new(q[1]), q2 = new(q[2]), q3 = new(q[3]),
-                      q4 = new(q[4]), q5 = new(q[5]), q6 = new(q[6]), q7 = new(q[7]),
-                      q8 = new(q[8]), q9 = new(q[9]), q10 = new(q[10]), q11 = new(q[11]),
-                      q12 = new(q[12]), q13 = new(q[13]);
-
-        Span<float> bd = stackalloc float[5] { float.MaxValue, float.MaxValue, float.MaxValue, float.MaxValue, float.MaxValue };
-        Span<int> bi = stackalloc int[5] { -1, -1, -1, -1, -1 };
-        float worst = float.MaxValue;
-
-        int W = Vector<float>.Count;
         int n0 = 0, n1 = N, n2 = 2 * N, n3 = 3 * N, n4 = 4 * N, n5 = 5 * N, n6 = 6 * N,
             n7 = 7 * N, n8 = 8 * N, n9 = 9 * N, n10 = 10 * N, n11 = 11 * N, n12 = 12 * N, n13 = 13 * N;
 
-        int limit = N - W;
         int b = 0;
-        for (; b <= limit; b += W)
-        {
-            Vector<float> d, acc;
-            d = new Vector<float>(dims, n0 + b) - q0; acc = d * d;
-            d = new Vector<float>(dims, n1 + b) - q1; acc += d * d;
-            d = new Vector<float>(dims, n2 + b) - q2; acc += d * d;
-            d = new Vector<float>(dims, n3 + b) - q3; acc += d * d;
-            d = new Vector<float>(dims, n4 + b) - q4; acc += d * d;
-            d = new Vector<float>(dims, n5 + b) - q5; acc += d * d;
-            d = new Vector<float>(dims, n6 + b) - q6; acc += d * d;
-            d = new Vector<float>(dims, n7 + b) - q7; acc += d * d;
-            d = new Vector<float>(dims, n8 + b) - q8; acc += d * d;
-            d = new Vector<float>(dims, n9 + b) - q9; acc += d * d;
-            d = new Vector<float>(dims, n10 + b) - q10; acc += d * d;
-            d = new Vector<float>(dims, n11 + b) - q11; acc += d * d;
-            d = new Vector<float>(dims, n12 + b) - q12; acc += d * d;
-            d = new Vector<float>(dims, n13 + b) - q13; acc += d * d;
+        int Ws = Vector<short>.Count;   // 16 com AVX2
+        int Wi = Vector<int>.Count;     // 8 com AVX2  (= Ws/2)
 
-            if (Vector.LessThanAny(acc, new Vector<float>(worst)))
+        if (Vector.IsHardwareAccelerated && N >= Ws)
+        {
+            Vector<short> q0 = new(q[0]), q1 = new(q[1]), q2 = new(q[2]), q3 = new(q[3]),
+                          q4 = new(q[4]), q5 = new(q[5]), q6 = new(q[6]), q7 = new(q[7]),
+                          q8 = new(q[8]), q9 = new(q[9]), q10 = new(q[10]), q11 = new(q[11]),
+                          q12 = new(q[12]), q13 = new(q[13]);
+
+            for (; b + Ws <= N; b += Ws)
             {
-                for (int l = 0; l < W; l++)
-                {
-                    float dist = acc[l];
-                    if (dist < worst) Insert(bd, bi, ref worst, dist, b + l);
-                }
+                Vector<short> sv, diff;
+                Vector<int> lo, hi, accLo = Vector<int>.Zero, accHi = Vector<int>.Zero;
+
+                sv = new Vector<short>(dims, n0 + b); diff = sv - q0; Vector.Widen(diff, out lo, out hi); accLo += lo * lo; accHi += hi * hi;
+                sv = new Vector<short>(dims, n1 + b); diff = sv - q1; Vector.Widen(diff, out lo, out hi); accLo += lo * lo; accHi += hi * hi;
+                sv = new Vector<short>(dims, n2 + b); diff = sv - q2; Vector.Widen(diff, out lo, out hi); accLo += lo * lo; accHi += hi * hi;
+                sv = new Vector<short>(dims, n3 + b); diff = sv - q3; Vector.Widen(diff, out lo, out hi); accLo += lo * lo; accHi += hi * hi;
+                sv = new Vector<short>(dims, n4 + b); diff = sv - q4; Vector.Widen(diff, out lo, out hi); accLo += lo * lo; accHi += hi * hi;
+                sv = new Vector<short>(dims, n5 + b); diff = sv - q5; Vector.Widen(diff, out lo, out hi); accLo += lo * lo; accHi += hi * hi;
+                sv = new Vector<short>(dims, n6 + b); diff = sv - q6; Vector.Widen(diff, out lo, out hi); accLo += lo * lo; accHi += hi * hi;
+                sv = new Vector<short>(dims, n7 + b); diff = sv - q7; Vector.Widen(diff, out lo, out hi); accLo += lo * lo; accHi += hi * hi;
+                sv = new Vector<short>(dims, n8 + b); diff = sv - q8; Vector.Widen(diff, out lo, out hi); accLo += lo * lo; accHi += hi * hi;
+                sv = new Vector<short>(dims, n9 + b); diff = sv - q9; Vector.Widen(diff, out lo, out hi); accLo += lo * lo; accHi += hi * hi;
+                sv = new Vector<short>(dims, n10 + b); diff = sv - q10; Vector.Widen(diff, out lo, out hi); accLo += lo * lo; accHi += hi * hi;
+                sv = new Vector<short>(dims, n11 + b); diff = sv - q11; Vector.Widen(diff, out lo, out hi); accLo += lo * lo; accHi += hi * hi;
+                sv = new Vector<short>(dims, n12 + b); diff = sv - q12; Vector.Widen(diff, out lo, out hi); accLo += lo * lo; accHi += hi * hi;
+                sv = new Vector<short>(dims, n13 + b); diff = sv - q13; Vector.Widen(diff, out lo, out hi); accLo += lo * lo; accHi += hi * hi;
+
+                // accLo -> refs b..b+Wi-1 ; accHi -> refs b+Wi..b+2Wi-1 (ordem de índice)
+                for (int l = 0; l < Wi; l++) { int dd = accLo[l]; if (dd < worst) Insert(bd, bl, ref worst, ref filled, dd, labs[b + l]); }
+                for (int l = 0; l < Wi; l++) { int dd = accHi[l]; if (dd < worst) Insert(bd, bl, ref worst, ref filled, dd, labs[b + Wi + l]); }
             }
         }
 
-        // Tail escalar (só executa se N % W != 0; com N=100000 e W in {4,8} não roda).
+        // cauda escalar (e caminho completo se não houver SIMD)
         for (; b < N; b++)
         {
-            float s = 0f;
+            int s = 0;
             s += Sq(dims[n0 + b] - q[0]); s += Sq(dims[n1 + b] - q[1]); s += Sq(dims[n2 + b] - q[2]);
             s += Sq(dims[n3 + b] - q[3]); s += Sq(dims[n4 + b] - q[4]); s += Sq(dims[n5 + b] - q[5]);
             s += Sq(dims[n6 + b] - q[6]); s += Sq(dims[n7 + b] - q[7]); s += Sq(dims[n8 + b] - q[8]);
             s += Sq(dims[n9 + b] - q[9]); s += Sq(dims[n10 + b] - q[10]); s += Sq(dims[n11 + b] - q[11]);
             s += Sq(dims[n12 + b] - q[12]); s += Sq(dims[n13 + b] - q[13]);
-            if (s < worst) Insert(bd, bi, ref worst, s, b);
+            if (s < worst) Insert(bd, bl, ref worst, ref filled, s, labs[b]);
         }
 
-        int fraud = 0;
-        for (int j = 0; j < 5; j++)
-        {
-            int ix = bi[j];
-            if (ix >= 0 && labs[ix] != 0) fraud++;
-        }
-        return fraud;
+        int c = 0;
+        for (int i = 0; i < filled; i++) c += bl[i];
+        return c;
     }
 
-    private static float Sq(float x) => x * x;
+    private static int Sq(int x) => x * x;
 
-    // Mantém os 5 menores. Empate desfeito por menor índice (ordem do dataset).
-    private static void Insert(Span<float> bd, Span<int> bi, ref float worst, float dist, int idx)
+    // Mantém os K menores. Empate (dd == worst) NÃO substitui => o de menor
+    // índice (visto antes) permanece, reproduzindo o desempate do gerador.
+    private static void Insert(Span<int> bd, Span<byte> bl, ref int worst, ref int filled, int dist, byte lab)
     {
-        int wj = 0;
-        float wv = bd[0];
-        for (int j = 1; j < 5; j++) { if (bd[j] > wv) { wv = bd[j]; wj = j; } }
-        bd[wj] = dist;
-        bi[wj] = idx;
-
-        float nw = bd[0];
-        for (int j = 1; j < 5; j++) { if (bd[j] > nw) nw = bd[j]; }
+        if (filled < K)
+        {
+            bd[filled] = dist; bl[filled] = lab; filled++;
+            if (filled == K)
+            {
+                int w = bd[0];
+                for (int j = 1; j < K; j++) if (bd[j] > w) w = bd[j];
+                worst = w;
+            }
+            return;
+        }
+        int wj = 0, wv = bd[0];
+        for (int j = 1; j < K; j++) if (bd[j] > wv) { wv = bd[j]; wj = j; }
+        bd[wj] = dist; bl[wj] = lab;
+        int nw = bd[0];
+        for (int j = 1; j < K; j++) if (bd[j] > nw) nw = bd[j];
         worst = nw;
     }
 }
