@@ -1,13 +1,3 @@
-# =============================================================================
-# Rinha de Backend 2026 - submissão (.NET 9 NativeAOT)
-#
-# IMPORTANTE (causa das suas rejeições anteriores):
-#  - NÃO existe diretiva `build:`. Só imagens PRÉ-CONSTRUÍDAS e PÚBLICAS.
-#  - Troque `SEU_USUARIO_DOCKERHUB` pelo seu usuário e publique a imagem ANTES
-#    (veja build-and-push.sh). A imagem precisa ser pullável sem login.
-#
-# Limites: api1 0.40 + api2 0.40 + nginx 0.20 = 1.00 CPU | 150+150+48 = 348 MB.
-# =============================================================================
 services:
   api1:
     image: docker.io/alealencarr/rinha-fraud-dotnet:latest
